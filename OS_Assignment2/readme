@@ -1,0 +1,16 @@
+==================================================
+CS F372: Operating Systems - Assignment 2
+Group Submission Details
+==================================================
+
+Group Members:
+1. Name: Pratyush Borana | ID: 2024A7PS0028H
+2. Name: Mridul Chawla   | ID: 2024A7PS0045H
+3. Name: Raghav Gupta    | ID: 2024A7PS0079H
+4. Name: Vedant Sharma   | ID: 2024A7PS0047H
+
+Directory Structure:
+- problem1/ : Multithreaded Student Report Card Generator
+- problem2/ : Real-Time Scheduling Analysis (SCHED_RR vs SCHED_FIFO)
+- problem3/ : Sudoku Conflict Analyzer and Repair Advisor
+- problem4/ : Fork Storm Containment & Tiered CPU Scheduling Kernel Module

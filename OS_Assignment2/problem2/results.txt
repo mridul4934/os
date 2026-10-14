@@ -1,0 +1,171 @@
+==================================================
+CS F372: Problem 2 - Scheduling Analysis Metrics
+==================================================
+
+Program-A (CPU-Bound)
+------------------------------------------
+Time Quantum: 1ms (Effective Kernel Jiffy Value: 1ms)
+Involuntary Context Switches: 1696
+Voluntary Context Switches:   8
+Average Response Time:        10.31ms
+Maximum Response Time:        25.58ms
+Average Turnaround Time:      3084.09ms
+Maximum Turnaround Time:      3239.17ms
+Throughput:                   2.47 children/s
+Total Elapsed Time:           3.24s
+
+Time Quantum: 10ms (Effective Kernel Jiffy Value: 10ms)
+Involuntary Context Switches: 188
+Voluntary Context Switches:   8
+Average Response Time:        46.46ms
+Maximum Response Time:        86.55ms
+Average Turnaround Time:      2801.99ms
+Maximum Turnaround Time:      3148.78ms
+Throughput:                   2.54 children/s
+Total Elapsed Time:           3.15s
+
+Time Quantum: 50ms (Effective Kernel Jiffy Value: 50ms)
+Involuntary Context Switches: 59
+Voluntary Context Switches:   8
+Average Response Time:        259.37ms
+Maximum Response Time:        617.84ms
+Average Turnaround Time:      3107.41ms
+Maximum Turnaround Time:      3344.81ms
+Throughput:                   2.39 children/s
+Total Elapsed Time:           3.35s
+
+Time Quantum: 150ms (Effective Kernel Jiffy Value: 150ms)
+Involuntary Context Switches: 65
+Voluntary Context Switches:   8
+Average Response Time:        1205.54ms
+Maximum Response Time:        2379.70ms
+Average Turnaround Time:      1850.87ms
+Maximum Turnaround Time:      2769.30ms
+Throughput:                   2.89 children/s
+Total Elapsed Time:           2.77s
+
+Time Quantum: 300ms (Effective Kernel Jiffy Value: 300ms)
+Involuntary Context Switches: 36
+Voluntary Context Switches:   8
+Average Response Time:        1364.63ms
+Maximum Response Time:        2759.28ms
+Average Turnaround Time:      3160.56ms
+Maximum Turnaround Time:      3536.93ms
+Throughput:                   2.26 children/s
+Total Elapsed Time:           3.54s
+
+Time Quantum: 500ms (Effective Kernel Jiffy Value: 500ms)
+Involuntary Context Switches: 30
+Voluntary Context Switches:   8
+Average Response Time:        1249.56ms
+Maximum Response Time:        2478.22ms
+Average Turnaround Time:      1602.00ms
+Maximum Turnaround Time:      2822.31ms
+Throughput:                   2.83 children/s
+Total Elapsed Time:           2.82s
+
+Scheduling Policy: SCHED_FIFO
+Involuntary Context Switches: 20
+Voluntary Context Switches:   8
+Average Response Time:        1256.54ms
+Maximum Response Time:        2473.77ms
+Average Turnaround Time:      1607.85ms
+Maximum Turnaround Time:      2812.15ms
+Throughput:                   2.84 children/s
+Total Elapsed Time:           2.81s
+
+Program-B (I/O-Bound)
+------------------------------------------
+Time Quantum: 1ms (Effective Kernel Jiffy Value: 1ms)
+Involuntary Context Switches: 179
+Voluntary Context Switches:   704
+Average Response Time:        3.89ms
+Maximum Response Time:        8.37ms
+Average Turnaround Time:      377.69ms
+Maximum Turnaround Time:      490.87ms
+Throughput:                   16.29 children/s
+Total Elapsed Time:           0.49s
+
+Time Quantum: 10ms (Effective Kernel Jiffy Value: 10ms)
+Involuntary Context Switches: 23
+Voluntary Context Switches:   42
+Average Response Time:        50.14ms
+Maximum Response Time:        99.52ms
+Average Turnaround Time:      343.80ms
+Maximum Turnaround Time:      358.97ms
+Throughput:                   22.27 children/s
+Total Elapsed Time:           0.36s
+
+Time Quantum: 50ms (Effective Kernel Jiffy Value: 50ms)
+Involuntary Context Switches: 8
+Voluntary Context Switches:   521
+Average Response Time:        128.85ms
+Maximum Response Time:        239.39ms
+Average Turnaround Time:      295.40ms
+Maximum Turnaround Time:      298.78ms
+Throughput:                   26.76 children/s
+Total Elapsed Time:           0.30s
+
+Time Quantum: 150ms (Effective Kernel Jiffy Value: 150ms)
+Involuntary Context Switches: 24
+Voluntary Context Switches:   36
+Average Response Time:        487.45ms
+Maximum Response Time:        877.15ms
+Average Turnaround Time:      1400.55ms
+Maximum Turnaround Time:      1423.46ms
+Throughput:                   5.62 children/s
+Total Elapsed Time:           1.42s
+
+Time Quantum: 300ms (Effective Kernel Jiffy Value: 300ms)
+Involuntary Context Switches: 8
+Voluntary Context Switches:   1263
+Average Response Time:        260.45ms
+Maximum Response Time:        502.26ms
+Average Turnaround Time:      677.83ms
+Maximum Turnaround Time:      682.24ms
+Throughput:                   11.72 children/s
+Total Elapsed Time:           0.68s
+
+Time Quantum: 500ms (Effective Kernel Jiffy Value: 500ms)
+Involuntary Context Switches: 9
+Voluntary Context Switches:   773
+Average Response Time:        133.38ms
+Maximum Response Time:        288.60ms
+Average Turnaround Time:      376.66ms
+Maximum Turnaround Time:      381.18ms
+Throughput:                   20.98 children/s
+Total Elapsed Time:           0.38s
+
+Scheduling Policy: SCHED_FIFO
+Involuntary Context Switches: 8
+Voluntary Context Switches:   561
+Average Response Time:        107.41ms
+Maximum Response Time:        162.91ms
+Average Turnaround Time:      377.41ms
+Maximum Turnaround Time:      387.99ms
+Throughput:                   20.61 children/s
+Total Elapsed Time:           0.39s
+
+==================================================
+Analysis of Results
+==================================================
+1. Effect of Quantum Size on Context Switches:
+   - For CPU-bound tasks (Program A), smaller time quanta trigger higher numbers of
+     involuntary context switches because processes exhaust their timeslice rapidly.
+   - As quantum size increases towards 500ms, involuntary context switches drop
+     dramatically, approaching FIFO behavior.
+
+2. Response Time vs. Turnaround Time:
+   - Round-Robin improves average response time for small quanta because CPU time is
+     distributed across processes faster.
+   - However, turnaround time increases for smaller quanta due to context switching overhead.
+
+3. Kernel Timer Granularity (HZ=250):
+   - On generic Ubuntu kernels configured with HZ=250, timer interrupts occur every 4ms.
+   - Consequently, setting a 1ms quantum results in an effective 4ms quantum, as the kernel
+     rounds up time slices to the nearest jiffy.
+
+4. SCHED_FIFO vs. SCHED_RR:
+   - Under SCHED_FIFO, CPU-bound tasks execute until completion without forced preemption.
+   - Involuntary context switches observed during FIFO runs originate from kernel threads or
+     system interrupts executing on CPU Core 0 rather than inter-process preemption.
