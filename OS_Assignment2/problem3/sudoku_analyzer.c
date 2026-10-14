@@ -117,6 +117,13 @@ void* analyze_block(void *arg) {
     pthread_exit(NULL);
 }
 
+static void join_and_free(pthread_t *threads, int n) {
+    for (int k = 0; k < n; k++) {
+        void *r = NULL;
+        if (pthread_join(threads[k], &r) == 0) free(r);
+    }
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <grid_file>\n", argv[0]);
@@ -171,25 +178,28 @@ int main(int argc, char *argv[]) {
         struct unit_params *p = malloc(sizeof(struct unit_params));
         if (!p) {
             perror("malloc failed");
-            for (int k = 0; k < created_val; k++) pthread_join(val_threads[k], NULL);
+            join_and_free(val_threads, created_val);
             return 1;
         }
         p->unit_id = i;
         if (pthread_create(&val_threads[i], NULL, validate_unit, p) != 0) {
             fprintf(stderr, "Failed to create validation thread %d\n", i);
             free(p);
-            for (int k = 0; k < created_val; k++) pthread_join(val_threads[k], NULL);
+            join_and_free(val_threads, created_val);
             return 1;
         }
         created_val++;
     }
 
     int valid_count = 0;
+    int join_failed = 0;
     for (int i = 0; i < NUM_UNITS; i++) {
-        void *res_ptr;
+        void *res_ptr = NULL;
+        /* On failure keep joining the remaining threads so every result is freed. */
         if (pthread_join(val_threads[i], &res_ptr) != 0 || !res_ptr) {
             fprintf(stderr, "Failed to join thread or null result for unit %d\n", i);
-            return 1;
+            join_failed = 1;
+            continue;
         }
         struct unit_result *res = (struct unit_result*)res_ptr;
         global_dup_mask[res->unit_id] = res->dup_mask;
@@ -200,6 +210,10 @@ int main(int argc, char *argv[]) {
             valid_count++;
         }
         free(res);
+    }
+
+    if (join_failed) {
+        return 1;
     }
 
     if (valid_count == NUM_UNITS) {

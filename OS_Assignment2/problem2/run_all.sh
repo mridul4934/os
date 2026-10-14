@@ -9,8 +9,8 @@ fi
 ORIG_TS=$(cat /proc/sys/kernel/sched_rr_timeslice_ms)
 trap 'echo $ORIG_TS > /proc/sys/kernel/sched_rr_timeslice_ms' EXIT
 
-gcc -O2 program_a.c -o program_a
-gcc -O2 program_b.c -o program_b
+gcc -Wall -Wextra -O2 program_a.c -o program_a
+gcc -Wall -Wextra -O2 program_b.c -o program_b
 
 RESULTS_FILE="results.txt"
 rm -f $RESULTS_FILE
@@ -27,8 +27,7 @@ echo "------------------------------------------" >> $RESULTS_FILE
 
 for q in "${QUANTA[@]}"; do
     echo $q > /proc/sys/kernel/sched_rr_timeslice_ms
-    EFFECTIVE=$(cat /proc/sys/kernel/sched_rr_timeslice_ms)
-    echo "Time Quantum: ${q}ms (Effective Kernel Jiffy Value: ${EFFECTIVE}ms)" >> $RESULTS_FILE
+    echo "Time Quantum: ${q}ms" >> $RESULTS_FILE
     taskset -c 0 chrt -r 20 ./program_a >> $RESULTS_FILE
     echo "" >> $RESULTS_FILE
 done
@@ -45,8 +44,7 @@ echo "------------------------------------------" >> $RESULTS_FILE
 
 for q in "${QUANTA[@]}"; do
     echo $q > /proc/sys/kernel/sched_rr_timeslice_ms
-    EFFECTIVE=$(cat /proc/sys/kernel/sched_rr_timeslice_ms)
-    echo "Time Quantum: ${q}ms (Effective Kernel Jiffy Value: ${EFFECTIVE}ms)" >> $RESULTS_FILE
+    echo "Time Quantum: ${q}ms" >> $RESULTS_FILE
     taskset -c 0 chrt -r 20 ./program_b >> $RESULTS_FILE
     echo "" >> $RESULTS_FILE
 done
@@ -75,8 +73,8 @@ Analysis of Results
 
 3. Kernel Timer Granularity (HZ=250):
    - On generic Ubuntu kernels configured with HZ=250, timer interrupts occur every 4ms.
-   - Consequently, setting a 1ms quantum results in an effective 4ms quantum, as the kernel
-     rounds up time slices to the nearest jiffy.
+   - sched_rr_timeslice_ms reads back the value written, but internally the slice is stored
+     in jiffies (rounded up), so a 1ms quantum behaves like a 4ms quantum in practice.
 
 4. SCHED_FIFO vs. SCHED_RR:
    - Under SCHED_FIFO, CPU-bound tasks execute until completion without forced preemption.
@@ -84,5 +82,5 @@ Analysis of Results
      system interrupts executing on CPU Core 0 rather than inter-process preemption.
 ANALYSIS
 
-chmod 755 $RESULTS_FILE
+chmod 644 $RESULTS_FILE
 echo "Benchmarking complete. Results generated in $RESULTS_FILE."
