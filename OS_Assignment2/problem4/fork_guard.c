@@ -1,169 +1,574 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * kernel/fork_guard.c - Fork storm containment and tiered CPU scheduling.
+ *
+ * Mechanism 1 (containment) is hooked at the top of kernel_clone() via
+ * fork_guard_check(). Mechanism 2 (tiers) is hooked in sched_fork() via
+ * fork_guard_tier_nice() and re-applied to running tasks when a tier
+ * changes. The containment check never looks at the tier, so a GOLD user
+ * is contained exactly like everyone else.
+ *
+ * Interfaces:
+ *   /proc/sys/kernel/fg_*   tunables (sysctl)
+ *   /proc/fork_guard        read-only stats + live tunables
+ *   /proc/fork_guard_ctl    root-only control: "set <uid> <tier>", "reset"
+ */
+
 #include <linux/fork_guard.h>
-#include <linux/module.h>
-#include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/kernel.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/sysctl.h>
 #include <linux/sched.h>
+#include <linux/sched/signal.h>
 #include <linux/cred.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/hashtable.h>
-#include <linux/delay.h>
-#include <linux/sched/signal.h>
 #include <linux/pid.h>
+#include <linux/workqueue.h>
+#include <linux/jiffies.h>
+#include <linux/capability.h>
+#include <linux/string.h>
 
-static int fg_enable = 1;
-static int fg_threshold = 200;
-static int fg_window_ms = 1000;
-static int fg_throttle_ms = 40;
-static int fg_cooldown_s = 10;
+/* ---------------------------------------------------------------- tunables */
 
-static int min_val = 0;
-static int max_val = 60000;
+static unsigned int fg_enable = 1;
+static unsigned int fg_threshold = 200;		/* forks per window */
+static unsigned int fg_window_ms = 1000;	/* sliding window length */
+static unsigned int fg_throttle_ms = 40;	/* penalty per refused fork */
+static unsigned int fg_cooldown_s = 10;		/* calm time before forgiveness */
 
-struct user_tier_entry {
-    uid_t uid;
-    char tier[16];
-    int nice_val;
-    int fork_count;
-    unsigned long window_start_jiffies;
-    unsigned long last_over_limit_jiffies;
-    int stage;
-    unsigned long throttle_events;
-    unsigned long freeze_events;
-    unsigned long reap_events;
-    struct hlist_node node;
+static unsigned int fg_zero;
+static unsigned int fg_one = 1;
+static unsigned int fg_threshold_max = 1000000;
+static unsigned int fg_window_min = 10;
+static unsigned int fg_window_max = 60000;
+static unsigned int fg_throttle_max = 1000;
+static unsigned int fg_cooldown_max = 3600;
+
+/* ------------------------------------------------------------------- tiers */
+
+enum fg_tier { TIER_SILVER = 0, TIER_GOLD, TIER_BRONZE };
+
+/*
+ * Starvation clamp: tier nice values are confined to [-7, +5].
+ * CFS weights: nice -7 = 4904, nice 0 = 1024, nice +5 = 335.
+ * Worst case GOLD vs BRONZE on one core: 335 / (4904 + 335) = ~6.4% for
+ * BRONZE, so it always makes measurable progress (never 0).
+ */
+#define FG_NICE_MIN	(-7)
+#define FG_NICE_MAX	5
+
+static const char * const tier_name[] = { "SILVER", "GOLD", "BRONZE" };
+static const int tier_nice[] = { 0, FG_NICE_MIN, FG_NICE_MAX };
+
+/* ------------------------------------------------------- per-user records */
+
+enum fg_stage { STAGE_NONE = 0, STAGE_THROTTLE, STAGE_FREEZE, STAGE_REAP };
+static const char * const stage_name[] = { "NONE", "THROTTLE", "FREEZE", "REAP" };
+
+struct fg_user {
+	kuid_t uid;
+	enum fg_tier tier;
+
+	/* sliding-window counter: current + previous fixed window */
+	unsigned long cur_start;
+	unsigned int cur_count;
+	unsigned int prev_count;
+
+	enum fg_stage stage;
+	unsigned long stage_since;	/* jiffies when current stage began */
+	unsigned long last_over;	/* last jiffies the user was over */
+
+	struct pid *frozen_pgrp;	/* group stopped at FREEZE, ref held */
+	struct delayed_work reap_work;
+
+	unsigned long throttle_events;
+	unsigned long freeze_events;
+	unsigned long reap_events;
+
+	struct hlist_node node;
 };
 
-static DEFINE_HASHTABLE(user_map, 4);
-static DEFINE_SPINLOCK(tier_lock);
+static DEFINE_HASHTABLE(fg_users, 6);
+static DEFINE_SPINLOCK(fg_lock);	/* protects fg_users and every fg_user */
+static unsigned int fg_nusers;
 
-static struct user_tier_entry* get_or_create_user(uid_t uid) {
-    struct user_tier_entry *entry;
-    hash_for_each_possible(user_map, entry, node, uid) {
-        if (entry->uid == uid) return entry;
-    }
+static void fg_reap_workfn(struct work_struct *work);
 
-    entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
-    if (!entry) return NULL;
+static struct fg_user *fg_find(kuid_t uid)
+{
+	struct fg_user *u;
 
-    entry->uid = uid;
-    strcpy(entry->tier, "SILVER");
-    entry->nice_val = 0;
-    entry->fork_count = 0;
-    entry->window_start_jiffies = jiffies;
-    entry->last_over_limit_jiffies = jiffies;
-    entry->stage = 0;
-    entry->throttle_events = 0;
-    entry->freeze_events = 0;
-    entry->reap_events = 0;
-
-    hash_add(user_map, &entry->node, uid);
-    return entry;
+	hash_for_each_possible(fg_users, u, node, __kuid_val(uid))
+		if (uid_eq(u->uid, uid))
+			return u;
+	return NULL;
 }
 
-void fork_guard_sched_hook(struct task_struct *p) {
-    uid_t uid = task_uid(p).val;
-    struct user_tier_entry *entry;
-    unsigned long flags;
+/* Caller holds fg_lock. Entries are never freed (one per user ever seen). */
+static struct fg_user *fg_find_or_create(kuid_t uid)
+{
+	struct fg_user *u = fg_find(uid);
 
-    if (uid == 0) return;
-
-    spin_lock_irqsave(&tier_lock, flags);
-    entry = get_or_create_user(uid);
-    if (entry) {
-        set_user_nice(p, entry->nice_val);
-    }
-    spin_unlock_irqrestore(&tier_lock, flags);
+	if (u)
+		return u;
+	u = kzalloc(sizeof(*u), GFP_ATOMIC);
+	if (!u)
+		return NULL;
+	u->uid = uid;
+	u->tier = TIER_SILVER;
+	u->cur_start = jiffies;
+	u->stage = STAGE_NONE;
+	INIT_DELAYED_WORK(&u->reap_work, fg_reap_workfn);
+	hash_add(fg_users, &u->node, __kuid_val(uid));
+	fg_nusers++;
+	return u;
 }
 
-int fork_guard_check(void) {
-    uid_t uid;
-    struct user_tier_entry *entry;
-    unsigned long now = jiffies;
-    unsigned long window_jiffies = msecs_to_jiffies(fg_window_ms);
-    unsigned long cooldown_jiffies = msecs_to_jiffies(fg_cooldown_s * 1000);
-    unsigned long flags;
-    int action_stage = 0;
-    int delay_ms = 0;
-    struct pid *pgrp;
-    int pgid = 0;
-
-    if (!fg_enable) return 0;
-
-    uid = current_uid().val;
-    if (uid == 0) return 0;
-
-    spin_lock_irqsave(&tier_lock, flags);
-    entry = get_or_create_user(uid);
-    if (!entry) {
-        spin_unlock_irqrestore(&tier_lock, flags);
-        return 0;
-    }
-
-    if (time_after(now, entry->last_over_limit_jiffies + cooldown_jiffies)) {
-        if (entry->stage > 0) {
-            pr_info("fork_guard: de-escalated uid=%d to stage 0\n", uid);
-        }
-        entry->stage = 0;
-    }
-
-    if (time_after(now, entry->window_start_jiffies + window_jiffies)) {
-        entry->window_start_jiffies = now;
-        entry->fork_count = 0;
-    }
-
-    entry->fork_count++;
-
-    if (entry->fork_count > fg_threshold) {
-        entry->last_over_limit_jiffies = now;
-
-        if (entry->stage == 0) {
-            entry->stage = 1;
-            entry->throttle_events++;
-            action_stage = 1;
-            delay_ms = fg_throttle_ms;
-        } else if (entry->stage == 1) {
-            entry->stage = 2;
-            entry->freeze_events++;
-            action_stage = 2;
-        } else {
-            entry->stage = 3;
-            entry->reap_events++;
-            action_stage = 3;
-            entry->fork_count = 0;
-            entry->stage = 0;
-        }
-    }
-
-    spin_unlock_irqrestore(&tier_lock, flags);
-
-    rcu_read_lock();
-    pgrp = task_pgrp(current);
-    if (pgrp) pgid = pid_vnr(pgrp);
-    rcu_read_unlock();
-
-    if (action_stage == 3) {
-        pr_warn("fork_guard: REAP uid=%d pgid=%d (SIGKILL process group)\n", uid, pgid);
-        if (pgrp) {
-            kill_pgrp(pgrp, SIGCONT, 1);
-            kill_pgrp(pgrp, SIGKILL, 1);
-        }
-        send_sig(SIGKILL, current, 0);
-        return -EAGAIN;
-    } else if (action_stage == 2) {
-        pr_warn("fork_guard: FREEZE uid=%d pgid=%d (SIGSTOP process group)\n", uid, pgid);
-        if (pgrp) {
-            kill_pgrp(pgrp, SIGSTOP, 1);
-        }
-        return -EAGAIN;
-    } else if (action_stage == 1) {
-        pr_warn("fork_guard: THROTTLE uid=%d pgid=%d (>%d forks in %d ms)\n", uid, pgid, fg_threshold, fg_window_ms);
-        if (delay_ms > 0) mdelay(delay_ms);
-        return -EAGAIN;
-    }
-
-    return 0;
+static unsigned long fg_window_jiffies(void)
+{
+	return max_t(unsigned long, 1, msecs_to_jiffies(READ_ONCE(fg_window_ms)));
 }
+
+/*
+ * Sliding-window rate: forks in the current window plus the previous
+ * window's count weighted by how much of it still overlaps the last
+ * window_ms. Caller holds fg_lock.
+ */
+static unsigned int fg_rate(struct fg_user *u, unsigned long now)
+{
+	unsigned long win = fg_window_jiffies();
+	unsigned long elapsed;
+
+	if (time_after_eq(now, u->cur_start + 2 * win)) {
+		u->prev_count = 0;
+		u->cur_count = 0;
+		u->cur_start = now;
+	} else if (time_after_eq(now, u->cur_start + win)) {
+		u->prev_count = u->cur_count;
+		u->cur_count = 0;
+		u->cur_start += win;
+	}
+	elapsed = now - u->cur_start;
+	return u->cur_count + (unsigned int)div_u64((u64)u->prev_count * (win - elapsed), win);
+}
+
+/* De-escalate after a calm period longer than the cooldown. Holds fg_lock. */
+static void fg_maybe_forgive(struct fg_user *u, unsigned long now)
+{
+	unsigned long cooldown = msecs_to_jiffies(READ_ONCE(fg_cooldown_s) * 1000);
+
+	if (u->stage == STAGE_NONE || u->stage == STAGE_FREEZE)
+		return;		/* FREEZE is resolved by the reap timer */
+	if (time_after(now, u->last_over + cooldown)) {
+		pr_info("fork_guard: uid=%u calm for >%us, %s -> NONE (forgiven)\n",
+			__kuid_val(u->uid), READ_ONCE(fg_cooldown_s),
+			stage_name[u->stage]);
+		u->stage = STAGE_NONE;
+		u->stage_since = now;
+	}
+}
+
+/* ------------------------------------------------------ containment hook */
+
+int fork_guard_check(unsigned long clone_flags)
+{
+	kuid_t uid = current_uid();
+	unsigned long now = jiffies;
+	unsigned long flags;
+	struct fg_user *u;
+	struct pid *freeze_pgrp = NULL;
+	enum fg_stage old_stage, new_stage;
+	unsigned int rate, threshold;
+	bool refuse = false;
+
+	if (!READ_ONCE(fg_enable))
+		return 0;
+	if (uid_eq(uid, GLOBAL_ROOT_UID) || (current->flags & PF_KTHREAD))
+		return 0;
+
+	threshold = READ_ONCE(fg_threshold);
+
+	spin_lock_irqsave(&fg_lock, flags);
+	u = fg_find_or_create(uid);
+	if (!u) {
+		spin_unlock_irqrestore(&fg_lock, flags);
+		return 0;	/* fail open on allocation failure */
+	}
+
+	fg_maybe_forgive(u, now);
+	u->cur_count++;			/* count attempts, refused ones too */
+	rate = fg_rate(u, now);
+	old_stage = u->stage;
+
+	if (rate > threshold) {
+		refuse = true;
+		u->last_over = now;
+
+		switch (u->stage) {
+		case STAGE_NONE:
+		case STAGE_REAP:	/* a fresh storm after a reap restarts the ladder */
+			u->stage = STAGE_THROTTLE;
+			u->stage_since = now;
+			u->throttle_events++;
+			break;
+		case STAGE_THROTTLE:
+			/* Still over a full window after throttling began: freeze. */
+			if (time_after_eq(now, u->stage_since + fg_window_jiffies())) {
+				rcu_read_lock();
+				freeze_pgrp = get_pid(task_pgrp(current));
+				rcu_read_unlock();
+				/* Never stop/kill init's group: keep throttling instead. */
+				if (pid_nr(freeze_pgrp) == 1) {
+					put_pid(freeze_pgrp);
+					freeze_pgrp = NULL;
+					break;
+				}
+				u->stage = STAGE_FREEZE;
+				u->stage_since = now;
+				u->freeze_events++;
+				u->frozen_pgrp = get_pid(freeze_pgrp);
+			}
+			break;
+		case STAGE_FREEZE:
+			break;		/* keep refusing; reap timer is pending */
+		}
+	}
+	new_stage = u->stage;
+	spin_unlock_irqrestore(&fg_lock, flags);
+
+	if (!refuse)
+		return 0;
+
+	if (new_stage != old_stage && new_stage == STAGE_THROTTLE)
+		pr_warn("fork_guard: THROTTLE uid=%u pid=%d comm=%s rate=%u > %u per %ums\n",
+			__kuid_val(uid), task_pid_nr(current), current->comm,
+			rate, threshold, READ_ONCE(fg_window_ms));
+
+	if (freeze_pgrp) {
+		pr_alert("fork_guard: FREEZE uid=%u pgid=%d: SIGSTOP to process group\n",
+			 __kuid_val(uid), pid_nr(freeze_pgrp));
+		kill_pgrp(freeze_pgrp, SIGSTOP, 1);
+		schedule_delayed_work(&u->reap_work, fg_window_jiffies());
+		put_pid(freeze_pgrp);
+		return -EAGAIN;
+	}
+
+	/* Penalty delay. Process context, no locks held, so sleeping is fine. */
+	if (READ_ONCE(fg_throttle_ms))
+		schedule_timeout_killable(msecs_to_jiffies(READ_ONCE(fg_throttle_ms)));
+
+	return -EAGAIN;
+}
+
+/*
+ * Runs one window after FREEZE. A stopped group cannot fork, so its fork
+ * rate can no longer be observed; a group that is still alive after the
+ * inspection period (nobody resumed or killed it) is treated as still
+ * over the threshold and is reaped.
+ *
+ * Signal order: SIGKILL first, then SIGCONT. SIGKILL is acted on even by
+ * stopped tasks; sending SIGCONT first would let the bomb run (and fork)
+ * again for a moment before the kill lands.
+ */
+static void fg_reap_workfn(struct work_struct *work)
+{
+	struct fg_user *u = container_of(to_delayed_work(work), struct fg_user,
+					 reap_work);
+	unsigned long flags;
+	struct pid *pgrp;
+	bool alive;
+
+	spin_lock_irqsave(&fg_lock, flags);
+	pgrp = u->frozen_pgrp;
+	u->frozen_pgrp = NULL;
+	spin_unlock_irqrestore(&fg_lock, flags);
+	if (!pgrp)
+		return;
+
+	rcu_read_lock();
+	alive = pid_task(pgrp, PIDTYPE_PGID) != NULL;
+	rcu_read_unlock();
+
+	if (alive) {
+		pr_alert("fork_guard: REAP uid=%u pgid=%d: SIGKILL to process group\n",
+			 __kuid_val(u->uid), pid_nr(pgrp));
+		kill_pgrp(pgrp, SIGKILL, 1);
+		kill_pgrp(pgrp, SIGCONT, 1);
+	} else {
+		pr_info("fork_guard: uid=%u pgid=%d gone before reap\n",
+			__kuid_val(u->uid), pid_nr(pgrp));
+	}
+
+	spin_lock_irqsave(&fg_lock, flags);
+	if (alive) {
+		u->stage = STAGE_REAP;
+		u->reap_events++;
+	} else {
+		u->stage = STAGE_THROTTLE;
+	}
+	u->stage_since = jiffies;
+	u->last_over = jiffies;		/* cooldown starts now */
+	spin_unlock_irqrestore(&fg_lock, flags);
+
+	put_pid(pgrp);
+}
+
+/* ------------------------------------------------------------- tier hooks */
+
+bool fork_guard_tier_nice(struct task_struct *p, int *nice)
+{
+	unsigned long flags;
+	struct fg_user *u;
+	bool ret = false;
+
+	spin_lock_irqsave(&fg_lock, flags);
+	u = fg_find(task_uid(p));
+	if (u && u->tier != TIER_SILVER) {
+		*nice = clamp(tier_nice[u->tier], FG_NICE_MIN, FG_NICE_MAX);
+		ret = true;
+	}
+	spin_unlock_irqrestore(&fg_lock, flags);
+	return ret;
+}
+
+/* Re-tier tasks that are already running. Called without fg_lock held. */
+static void fg_retier_uid(kuid_t uid, int nice)
+{
+	struct task_struct *g, *p;
+
+	rcu_read_lock();
+	for_each_process_thread(g, p) {
+		if (!uid_eq(task_uid(p), uid))
+			continue;
+		if (p->policy != SCHED_NORMAL && p->policy != SCHED_BATCH)
+			continue;	/* leave RT/DL/IDLE tasks alone */
+		set_user_nice(p, nice);
+	}
+	rcu_read_unlock();
+}
+
+static int fg_set_tier(kuid_t uid, enum fg_tier tier)
+{
+	kuid_t demoted = INVALID_UID;
+	unsigned long flags;
+	struct fg_user *u, *other;
+	int bkt;
+
+	spin_lock_irqsave(&fg_lock, flags);
+	u = fg_find_or_create(uid);
+	if (!u) {
+		spin_unlock_irqrestore(&fg_lock, flags);
+		return -ENOMEM;
+	}
+	if (tier == TIER_GOLD) {
+		hash_for_each(fg_users, bkt, other, node) {
+			if (other != u && other->tier == TIER_GOLD) {
+				other->tier = TIER_SILVER;
+				demoted = other->uid;
+			}
+		}
+	}
+	u->tier = tier;
+	spin_unlock_irqrestore(&fg_lock, flags);
+
+	if (uid_valid(demoted)) {
+		pr_info("fork_guard: tier uid=%u GOLD -> SILVER (only one GOLD allowed)\n",
+			__kuid_val(demoted));
+		fg_retier_uid(demoted, tier_nice[TIER_SILVER]);
+	}
+	pr_info("fork_guard: tier uid=%u -> %s (nice %d)\n",
+		__kuid_val(uid), tier_name[tier], tier_nice[tier]);
+	fg_retier_uid(uid, tier_nice[tier]);
+	return 0;
+}
+
+static int fg_reset_tiers(void)
+{
+	unsigned long flags;
+	struct fg_user *u;
+	kuid_t *uids;
+	unsigned int n = 0, i, cap;
+	int bkt;
+
+	spin_lock_irqsave(&fg_lock, flags);
+	cap = fg_nusers;
+	uids = kmalloc_array(max(cap, 1u), sizeof(*uids), GFP_ATOMIC);
+	if (!uids) {
+		spin_unlock_irqrestore(&fg_lock, flags);
+		return -ENOMEM;
+	}
+	hash_for_each(fg_users, bkt, u, node) {
+		if (u->tier != TIER_SILVER && n < cap)
+			uids[n++] = u->uid;
+		u->tier = TIER_SILVER;
+	}
+	spin_unlock_irqrestore(&fg_lock, flags);
+
+	for (i = 0; i < n; i++)
+		fg_retier_uid(uids[i], tier_nice[TIER_SILVER]);
+	kfree(uids);
+	pr_info("fork_guard: tier reset, all users SILVER\n");
+	return 0;
+}
+
+/* ------------------------------------------------------------------ /proc */
+
+static int fg_stats_show(struct seq_file *m, void *v)
+{
+	unsigned long now = jiffies;
+	unsigned long flags;
+	struct fg_user *u;
+	int bkt;
+
+	seq_puts(m, "# tunables (/proc/sys/kernel/fg_*)\n");
+	seq_printf(m, "fg_enable=%u fg_threshold=%u fg_window_ms=%u fg_throttle_ms=%u fg_cooldown_s=%u\n",
+		   READ_ONCE(fg_enable), READ_ONCE(fg_threshold),
+		   READ_ONCE(fg_window_ms), READ_ONCE(fg_throttle_ms),
+		   READ_ONCE(fg_cooldown_s));
+	seq_printf(m, "tier_nice: GOLD=%d SILVER=%d BRONZE=%d\n",
+		   tier_nice[TIER_GOLD], tier_nice[TIER_SILVER], tier_nice[TIER_BRONZE]);
+	seq_puts(m, "# per-user\n");
+	seq_printf(m, "%-8s %-7s %-6s %-9s %-9s %-7s %-5s\n",
+		   "UID", "TIER", "FORKS", "STAGE", "THROTTLE", "FREEZE", "REAP");
+
+	spin_lock_irqsave(&fg_lock, flags);
+	hash_for_each(fg_users, bkt, u, node) {
+		fg_maybe_forgive(u, now);
+		seq_printf(m, "%-8u %-7s %-6u %-9s %-9lu %-7lu %-5lu\n",
+			   __kuid_val(u->uid), tier_name[u->tier], fg_rate(u, now),
+			   stage_name[u->stage], u->throttle_events,
+			   u->freeze_events, u->reap_events);
+	}
+	spin_unlock_irqrestore(&fg_lock, flags);
+	return 0;
+}
+
+static int fg_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, fg_stats_show, NULL);
+}
+
+static const struct proc_ops fg_stats_ops = {
+	.proc_open	= fg_stats_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+};
+
+/* Commands: "set <uid> <gold|silver|bronze>" or "reset". */
+static ssize_t fg_ctl_write(struct file *file, const char __user *ubuf,
+			    size_t count, loff_t *ppos)
+{
+	char buf[64], tier_str[16];
+	unsigned int raw_uid;
+	enum fg_tier tier;
+	kuid_t uid;
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	if (count == 0 || count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+	strim(buf);
+
+	if (!strcasecmp(buf, "reset")) {
+		ret = fg_reset_tiers();
+		return ret ? ret : count;
+	}
+
+	if (sscanf(buf, "set %u %15s", &raw_uid, tier_str) != 2)
+		return -EINVAL;
+
+	if (!strcasecmp(tier_str, "gold"))
+		tier = TIER_GOLD;
+	else if (!strcasecmp(tier_str, "silver"))
+		tier = TIER_SILVER;
+	else if (!strcasecmp(tier_str, "bronze"))
+		tier = TIER_BRONZE;
+	else
+		return -EINVAL;
+
+	uid = make_kuid(current_user_ns(), raw_uid);
+	if (!uid_valid(uid))
+		return -EINVAL;
+
+	ret = fg_set_tier(uid, tier);
+	return ret ? ret : count;
+}
+
+static const struct proc_ops fg_ctl_ops = {
+	.proc_write	= fg_ctl_write,
+};
+
+/* ----------------------------------------------------------------- sysctl */
+
+static struct ctl_table fg_sysctls[] = {
+	{
+		.procname	= "fg_enable",
+		.data		= &fg_enable,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= &fg_zero,
+		.extra2		= &fg_one,
+	},
+	{
+		.procname	= "fg_threshold",
+		.data		= &fg_threshold,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= &fg_one,
+		.extra2		= &fg_threshold_max,
+	},
+	{
+		.procname	= "fg_window_ms",
+		.data		= &fg_window_ms,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= &fg_window_min,
+		.extra2		= &fg_window_max,
+	},
+	{
+		.procname	= "fg_throttle_ms",
+		.data		= &fg_throttle_ms,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= &fg_zero,
+		.extra2		= &fg_throttle_max,
+	},
+	{
+		.procname	= "fg_cooldown_s",
+		.data		= &fg_cooldown_s,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= &fg_one,
+		.extra2		= &fg_cooldown_max,
+	},
+	{ }
+};
+
+static int __init fork_guard_init(void)
+{
+	if (!register_sysctl("kernel", fg_sysctls))
+		pr_err("fork_guard: sysctl registration failed\n");
+	if (!proc_create("fork_guard", 0444, NULL, &fg_stats_ops))
+		pr_err("fork_guard: cannot create /proc/fork_guard\n");
+	if (!proc_create("fork_guard_ctl", 0200, NULL, &fg_ctl_ops))
+		pr_err("fork_guard: cannot create /proc/fork_guard_ctl\n");
+
+	pr_info("fork_guard: ready (threshold=%u per %ums, throttle=%ums, cooldown=%us)\n",
+		fg_threshold, fg_window_ms, fg_throttle_ms, fg_cooldown_s);
+	return 0;
+}
+late_initcall(fork_guard_init);

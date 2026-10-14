@@ -1,0 +1,161 @@
+c[?7l[2J[0mSeaBIOS (version 1.16.3-debian-1.16.3-2)
+
+
+iPXE (https://ipxe.org) 00:03.0 CA00 PCI2.10 PnP PMM+3EFCAE00+3EF0AE00 CA00
+Press Ctrl-B to configure iPXE (PCI 00:03.0)...                                                                               
+
+
+Booting from ROM...
+c[?7l[2J[    2.635383] fail to initialize ptp_kvm
+=== BOOT
+6.8.0-dirty
+# tunables (/proc/sys/kernel/fg_*)
+fg_enable=1 fg_threshold=200 fg_window_ms=1000 fg_throttle_ms=40 fg_cooldown_s=10
+tier_nice: GOLD=-7 SILVER=0 BRONZE=5
+# per-user
+UID      TIER    FORKS  STAGE     THROTTLE  FREEZE  REAP 
+fg_cooldown_s
+fg_enable
+fg_threshold
+fg_throttle_ms
+fg_window_ms
+=== T1 baseline (both SILVER)
+  alice=50% bob=49%  (ticks alice=346 bob=341)
+=== T2 promote alice GOLD (running job)
+User alice (UID 1000) set to gold.
+  alice=82% bob=17%  (ticks alice=738 bob=153)
+  nice of alice procs:
+alice       -7 sh
+=== T3 demote bob BRONZE
+User bob (UID 1001) set to bronze.
+  alice=93% bob=6%  (ticks alice=788 bob=57)
+=== T3b only one GOLD: set bob gold
+User bob (UID 1001) set to gold.
+1001     GOLD    0      NONE      0         0       0     bob
+1000     SILVER  0      NONE      0         0       0     alice
+=== T4 reset
+All users reset to SILVER tier.
+  alice=49% bob=50%  (ticks alice=329 bob=340)
+=== non-root tier set must fail
+Error: only root can change tiers (try sudo).
+  exit=1
+=== bad tier must fail
+Error: tier must be gold, silver or bronze.
+  exit=1
+=== T5 containment, untiered (threshold 50)
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+  t=1s alice procs=44
+  t=2s alice procs=31
+  t=3s alice procs=6
+  t=4s alice procs=0
+[   50.109913] fork_guard: THROTTLE uid=1000 pid=902 comm=bash rate=51 > 50 per 1000ms
+[   51.172686] fork_guard: FREEZE uid=1000 pgid=871: SIGSTOP to process group
+[   52.216847] fork_guard: REAP uid=1000 pgid=871: SIGKILL to process group
+UID      TIER    FORKS  STAGE     THROTTLE  FREEZE  REAP 
+1000     SILVER  0      REAP      1         1       1    
+=== T6 containment, alice GOLD
+User alice (UID 1000) set to gold.
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+  t=1s alice procs=44
+  t=2s alice procs=34
+  t=3s alice procs=0
+  t=4s alice procs=0
+[   54.007740] fork_guard: THROTTLE uid=1000 pid=1222 comm=bash rate=51 > 50 per 1000ms
+[   55.106027] fork_guard: FREEZE uid=1000 pgid=1201: SIGSTOP to process group
+[   56.120828] fork_guard: REAP uid=1000 pgid=1201: SIGKILL to process group
+UID      TIER    FORKS  STAGE     THROTTLE  FREEZE  REAP 
+1000     GOLD    0      REAP      2         2       2    
+=== child inherits GOLD nice:
+-7
+All users reset to SILVER tier.
+=== T7 retune threshold 10
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+environment: fork: retry: Resource temporarily unavailable
+  t=1s alice procs=9
+  t=2s alice procs=7
+  t=3s alice procs=2
+  t=4s alice procs=0
+[   57.849976] fork_guard: THROTTLE uid=1000 pid=1536 comm=bash rate=11 > 10 per 1000ms
+[   58.905019] fork_guard: FREEZE uid=1000 pgid=1529: SIGSTOP to process group
+[   59.960886] fork_guard: REAP uid=1000 pgid=1529: SIGKILL to process group
+UID      TIER    FORKS  STAGE     THROTTLE  FREEZE  REAP 
+1000     SILVER  0      REAP      3         3       3    
+=== cooldown: wait 4s
+  remaining alice procs: 0
+# tunables (/proc/sys/kernel/fg_*)
+fg_enable=1 fg_threshold=10 fg_window_ms=1000 fg_throttle_ms=40 fg_cooldown_s=2
+tier_nice: GOLD=-7 SILVER=0 BRONZE=5
+# per-user
+UID      TIER    FORKS  STAGE     THROTTLE  FREEZE  REAP  USER
+1001     SILVER  0      NONE      0         0       0     bob
+1000     SILVER  0      NONE      3         3       3     alice
+=== legit burst under threshold (40 forks, threshold 50) must succeed
+  ok=40/40
+=== DONE
+[   68.166126] reboot: Power down
